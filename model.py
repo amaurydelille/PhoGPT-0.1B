@@ -430,14 +430,57 @@ class Translator:
             out_ids.append(tid)
         return self.vi_tokenizer.decode(torch.tensor(out_ids, dtype=torch.long))
 
+    def translate_stream(self, sentence: str) -> None:
+        src = self.en_tokenizer.encode(sentence).unsqueeze(0)
+        bos_id = self.vi_tokenizer.bos_token
+        eos_id = self.vi_tokenizer.eos_token
+        generated = [bos_id]
+        max_len = self.vi_tokenizer.max_len
+
+        device = next(self.model.parameters()).device
+        src = src.to(device)
+        
+        # Track previous decoded text to print only new characters
+        previous_text = ""
+        
+        with torch.no_grad():
+            for _ in range(max_len - 1):
+                tgt = torch.tensor(generated, dtype=torch.long, device=src.device).unsqueeze(0)
+                logits = self.model(src, tgt)
+                next_id = logits[:, -1, :].argmax(dim=-1).item()
+                generated.append(next_id)
+                
+                if next_id == eos_id:
+                    break
+                
+                # Decode the accumulated sequence (excluding BOS/EOS for display)
+                out_ids = [tid for tid in generated[1:] if tid != eos_id and tid != self.vi_tokenizer.pad_token]
+                if out_ids:
+                    current_text = self.vi_tokenizer.decode(torch.tensor(out_ids, dtype=torch.long))
+                    
+                    # Print only the new characters
+                    if len(current_text) > len(previous_text):
+                        new_text = current_text[len(previous_text):]
+                        print(new_text, end="", flush=True)
+                        previous_text = current_text
+                time.sleep(0.1)
+        
+        print()  # Newline at the end
+
+    def run(self):
+        while True:
+            sentence = input("Enter a sentence: ")
+            if sentence.lower() == "exit":
+                break
+            print(f"You:        {sentence}")
+            print("Translation: ", end="")
+            self.translate_stream(sentence)
+            print()
 
 if __name__ == "__main__":
-    trainer = Trainer(batch_size=128, epochs=3, slice_size=50000, device="mps", verbose=False)
-    trainer.train()
+    # trainer = Trainer(batch_size=128, epochs=5, slice_size=254000, device="mps", verbose=False)
+    # trainer.train()
 
     translator = Translator(model_path=str(project_root / "checkpoints" / "transformer.pth"))
-    original = "Give me that coffee cup"
-    translation = translator.translate(original)
-
-    print(f"Original: {original}")
-    print(f"Translation: {translation}")
+    original = "How are you ?"
+    translator.run()
