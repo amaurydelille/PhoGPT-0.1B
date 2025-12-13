@@ -466,7 +466,7 @@ class Trainer:
 
 class Translator:
     def __init__(self, model_path: str) -> None:
-        ckpt = torch.load(model_path)
+        ckpt = torch.load(model_path, map_location='mps')
         self.model = Transformer(
             d_model=ckpt.get("d_model", DIM_MODEL),
             num_heads=ckpt.get("num_heads", NUM_HEADS),
@@ -516,7 +516,6 @@ class Translator:
         device = next(self.model.parameters()).device
         src = src.to(device)
         
-        # Track previous decoded text to print only new characters
         previous_text = ""
         
         with torch.no_grad():
@@ -529,36 +528,29 @@ class Translator:
                 if next_id == eos_id:
                     break
                 
-                # Decode the accumulated sequence (excluding BOS/EOS for display)
                 out_ids = [tid for tid in generated[1:] if tid != eos_id and tid != self.vi_tokenizer.pad_token]
                 if out_ids:
                     current_text = self.vi_tokenizer.decode(torch.tensor(out_ids, dtype=torch.long))
                     
-                    # Print only the new characters
                     if len(current_text) > len(previous_text):
                         new_text = current_text[len(previous_text):]
                         print(new_text, end="", flush=True)
                         previous_text = current_text
-                time.sleep(0.1)
+                # time.sleep(0.1)
         
-        print()  # Newline at the end
+        print() 
 
     def run(self):
         while True:
-            sentence = input("Enter a sentence: ")
+            sentence = input("You:    ")
             if sentence.lower() == "exit":
                 break
-            print(f"You:        {sentence}")
-            print("Translation: ", end="")
+            print("PhoGPT: ", end="")
             self.translate_stream(sentence)
             print()
 
 if __name__ == "__main__":
-    trainer = Trainer(batch_size=128, epochs=10, device="mps", verbose=False)
-    print(sum(p.numel() for p in trainer.transformer.parameters()))
-    trainer.train()
 
-
-    translator = Translator(model_path=str(project_root / "checkpoints" / "transformer_latest_epoch_1.pth"))
+    translator = Translator(model_path=str(project_root / "checkpoints" / "transformer_epoch_1.pth"))
     original = "How are you ?"
     translator.run()
