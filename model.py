@@ -12,16 +12,11 @@ from safetensors.torch import save_file
 project_root = Path(__file__).parent.resolve()
 
 loss_metrics_file = project_root / "metrics" / "loss.csv"
-eval_metrics_file = project_root / "metrics" / "eval.csv"
 loss_metrics_file.parent.mkdir(parents=True, exist_ok=True)
 if not loss_metrics_file.exists() or loss_metrics_file.stat().st_size == 0:
     with open(loss_metrics_file, 'w', newline='') as file:
         writer = csv.writer(file)
         writer.writerow(['epoch', 'batch', 'loss'])
-if not eval_metrics_file.exists() or eval_metrics_file.stat().st_size == 0:
-    with open(eval_metrics_file, 'w', newline='') as file:
-        writer = csv.writer(file)
-        writer.writerow(['epoch', 'test_loss', 'perplexity'])
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -409,22 +404,21 @@ class Transformer(nn.Module):
         return self.decoder(x=tgt_embedded, encoder_output=encoder_output, kv_pad_mask=src_kv_mask, q_pad_mask=tgt_q_mask)  # (B, seq_len, vocab_size)
 
 class Trainer:
-    def __init__(self, batch_size: int, epochs: int, device: str, verbose: bool, patience: int = 2) -> None:
+    def __init__(self, batch_size: int, epochs: int, device: str, verbose: bool) -> None:
         self.d_model = DIM_MODEL
         self.num_heads = NUM_HEADS
         self.max_len = 128
         self.device = torch.device(device)
         self.verbose = verbose
-        self.patience = patience
 
         self.batch_size = batch_size
         self.epochs = epochs
 
-        self.en_sents = get_sentences(str(project_root / "dataset" / "train.en"))[:1]
-        self.vi_sents = get_sentences(str(project_root / "dataset" / "train.vi"))[:1]
-        
-        self.test_en_sents = get_sentences(str(project_root / "dataset" / "PhoMT" / "detokenization" / "test" / "test.en"))
-        self.test_vi_sents = get_sentences(str(project_root / "dataset" / "PhoMT" / "detokenization" / "test" / "test.vi"))
+        en_sents = project_root / "dataset" / "train.en"
+        vi_sents = project_root / "dataset" / "train.vi"
+
+        self.en_sents = get_sentences(str(en_sents))[:1]
+        self.vi_sents = get_sentences(str(vi_sents))[:1]
 
         self.en_tokenizer = Tokenizer(max_len=self.max_len, spm_model_path=str(project_root / "tokenizer" / "en_spm.model"))
         self.vi_tokenizer = Tokenizer(max_len=self.max_len, spm_model_path=str(project_root / "tokenizer" / "vi_spm.model"))
@@ -442,57 +436,21 @@ class Trainer:
         )
 
         logger.info(f"Loaded transformer with: {sum(p.numel() for p in self.transformer.parameters())} parameters")
-        logger.info(f"Train samples: {len(self.en_sents)}, Test samples: {len(self.test_en_sents)}")
 
         self.criterion = nn.CrossEntropyLoss(ignore_index=self.vi_tokenizer.pad_token)
         self.optimizer = torch.optim.Adam(self.transformer.parameters(), lr=1e-4)
         self.transformer.to(self.device)
-        
-        self.best_test_loss = float('inf')
-        self.patience_counter = 0
 
-    def get_batch(self, start_idx: int, test: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
-        en_data = self.test_en_sents if test else self.en_sents
-        vi_data = self.test_vi_sents if test else self.vi_sents
-        end_idx = min(start_idx + self.batch_size, len(en_data))
+    def get_batch(self, start_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        end_idx = min(start_idx + self.batch_size, len(self.en_sents))
 
-        en_batch = en_data[start_idx:end_idx]
-        vi_batch = vi_data[start_idx:end_idx]
+        en_batch = self.en_sents[start_idx:end_idx]
+        vi_batch = self.vi_sents[start_idx:end_idx]
 
-        en_tokens = self.en_tokenizer.encode_batch(en_batch)
-        vi_tokens = self.vi_tokenizer.encode_batch(vi_batch)
+        en_tokens = self.en_tokenizer.encode_batch(en_batch)  # (B, seq_len) token IDs
+        vi_tokens = self.vi_tokenizer.encode_batch(vi_batch)  # (B, seq_len) token IDs
 
         return en_tokens.to(self.device), vi_tokens.to(self.device)
-
-    @torch.no_grad()
-    def evaluate(self, epoch: int) -> Tuple[float, float]:
-        self.transformer.eval()
-        total_loss = 0.0
-        num_batches = (len(self.test_en_sents) + self.batch_size - 1) // self.batch_size
-        
-        for batch_idx in range(num_batches):
-            src, tgt_full = self.get_batch(batch_idx * self.batch_size, test=True)
-            bos = torch.full((tgt_full.size(0), 1), self.vi_tokenizer.bos_token, dtype=torch.long, device=self.device)
-            tgt_in = torch.cat([bos, tgt_full[:, :-1]], dim=1)
-            
-            logits, aux_loss = self.transformer(src, tgt_in)
-            B, L_logit, V_tgt = logits.shape
-            if L_logit != tgt_full.size(1):
-                tgt_full = tgt_full[:, :L_logit]
-            
-            ce_loss = self.criterion(logits.reshape(-1, V_tgt), tgt_full.reshape(-1).long())
-            loss = ce_loss + 0.01 * aux_loss
-            total_loss += loss.item()
-        
-        avg_loss = total_loss / max(1, num_batches)
-        perplexity = torch.exp(torch.tensor(avg_loss)).item()
-        
-        with open(eval_metrics_file, 'a') as file:
-            writer = csv.writer(file)
-            writer.writerow([epoch + 1, avg_loss, perplexity])
-        
-        logger.info(f"Test Loss: {avg_loss:.4f}, Perplexity: {perplexity:.2f}")
-        return avg_loss, perplexity
 
     def train_epoch(self, epoch: int) -> float:
         self.transformer.train()
@@ -528,59 +486,64 @@ class Trainer:
                 logger.info(f"Batch {batch_idx}/{num_batches}, Loss: {loss.item():.4f}")
         return total_loss / max(1, num_batches)
 
-    def _save_checkpoint(self, path_base: Path) -> None:
-        state = {
-            "state_dict": self.transformer.state_dict(),
-            "vocab_size": self.vocab_size,
-            "d_model": self.d_model,
-            "num_heads": self.num_heads,
-            "num_layers": NUM_LAYERS,
-            "d_ff": DIM_FF_HIDDEN,
-            "max_len": self.max_len,
-        }
-        torch.save(state, str(path_base.with_suffix(".pth")))
-        torch.save(state, str(path_base.with_suffix(".bin")))
-        save_file(state["state_dict"], str(path_base.with_suffix(".safetensors")))
-
     def train(self):
-        checkpoint_dir = project_root / "checkpoints"
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        last_epoch = 0
-        
-        try:
-            start_time = time.time()
-            for epoch in range(self.epochs):
-                logger.info(f"\n=== Epoch {epoch + 1}/{self.epochs} ===")
-                avg_loss = self.train_epoch(epoch)
-                logger.info(f"Train Loss: {avg_loss:.4f}")
-                
-                test_loss, _ = self.evaluate(epoch)
-                
-                if test_loss < self.best_test_loss:
-                    self.best_test_loss = test_loss
-                    self.patience_counter = 0
-                    self._save_checkpoint(checkpoint_dir / "transformer_best")
-                    logger.info(f"New best model saved (test_loss={test_loss:.4f})")
-                else:
-                    self.patience_counter += 1
-                    logger.info(f"No improvement. Patience: {self.patience_counter}/{self.patience}")
-                
-                self._save_checkpoint(checkpoint_dir / f"transformer_epoch_{epoch + 1}")
-                last_epoch = epoch + 1
-                
-                if self.patience_counter >= self.patience:
-                    logger.info(f"Early stopping triggered after {epoch + 1} epochs")
-                    break
+      checkpoint_dir = project_root / "checkpoints"
+      checkpoint_dir.mkdir(parents=True, exist_ok=True)
+      last_epoch = 0
+      try:
+        start_time = time.time()
+        for epoch in range(self.epochs):
+            logger.info(f"\n=== Epoch {epoch + 1}/{self.epochs} ===")
+            avg_loss = self.train_epoch(epoch)
+            logger.info(f"Average Loss: {avg_loss:.4f}")
 
-            end_time = time.time()
-            logger.info(f"Training time: {end_time - start_time:.2f} seconds")
-            
-        except KeyboardInterrupt:
-            self._save_checkpoint(checkpoint_dir / f"transformer_latest_epoch_{last_epoch}")
-            raise
-        except Exception as e:
-            self._save_checkpoint(checkpoint_dir / f"transformer_latest_epoch_{last_epoch}")
-            raise e
+            state = {
+                "state_dict": self.transformer.state_dict(),
+                "vocab_size": self.vocab_size,
+                "d_model": self.d_model,
+                "num_heads": self.num_heads,
+                "num_layers": NUM_LAYERS,
+                "d_ff": DIM_FF_HIDDEN,
+                "max_len": self.max_len,
+            }
+            base = checkpoint_dir / f"transformer_epoch_{epoch + 1}"
+            torch.save(state, str(base.with_suffix(".pth")))
+            torch.save(state, str(base.with_suffix(".bin")))
+            save_file(state["state_dict"], str(base.with_suffix(".safetensors")))
+            last_epoch = epoch + 1
+
+        end_time = time.time()
+        logger.info(f"Training time: {end_time - start_time:.2f} seconds")
+      except KeyboardInterrupt as e:
+          state = {
+              "state_dict": self.transformer.state_dict(),
+              "vocab_size": self.vocab_size,
+              "d_model": self.d_model,
+              "num_heads": self.num_heads,
+              "num_layers": NUM_LAYERS,
+              "d_ff": DIM_FF_HIDDEN,
+              "max_len": self.max_len,
+          }
+          base = checkpoint_dir / f"transformer_latest_epoch_{last_epoch}"
+          torch.save(state, str(base.with_suffix(".pth")))
+          torch.save(state, str(base.with_suffix(".bin")))
+          save_file(state["state_dict"], str(base.with_suffix(".safetensors")))
+          raise e
+      except Exception as e:
+          state = {
+              "state_dict": self.transformer.state_dict(),
+              "vocab_size": self.vocab_size,
+              "d_model": self.d_model,
+              "num_heads": self.num_heads,
+              "num_layers": NUM_LAYERS,
+              "d_ff": DIM_FF_HIDDEN,
+              "max_len": self.max_len,
+          }
+          base = checkpoint_dir / f"transformer_latest_epoch_{last_epoch}"
+          torch.save(state, str(base.with_suffix(".pth")))
+          torch.save(state, str(base.with_suffix(".bin")))
+          save_file(state["state_dict"], str(base.with_suffix(".safetensors")))
+          raise e
 
 
 class Translator:
@@ -669,11 +632,10 @@ class Translator:
             print()
 
 if __name__ == "__main__":
-    BATCH_SIZE = 128
-    EPOCHS = 10
-    PATIENCE = 2
-    trainer = Trainer(batch_size=BATCH_SIZE, epochs=EPOCHS, device="mps", verbose=True, patience=PATIENCE)
-    trainer.train()
+    # BATCH_SIZE = 128
+    # EPOCHS = 3
+    # trainer = Trainer(batch_size=BATCH_SIZE, epochs=EPOCHS, device="mps", verbose=True)
+    # trainer.train()
 
-    # translator = Translator(model_path=str(project_root / "checkpoints" / "transformer_best.pth"))
-    # translator.run()
+    translator = Translator(model_path=str(project_root / "checkpoints" / "transformer_latest_epoch_1.pth"))
+    translator.run()
