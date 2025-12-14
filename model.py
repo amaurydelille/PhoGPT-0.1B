@@ -28,6 +28,8 @@ NUM_HEADS = 8
 SRC_VOCAB_SIZE = 32000
 TGT_VOCAB_SIZE = 32000
 MAX_LEN = 128
+NUM_EXPERTS = 4
+TOP_K = 2
 
 def get_sentences(file_path: str) -> List[str]:
     with open(file=file_path, mode='r', encoding='utf-8') as file:
@@ -202,14 +204,6 @@ class CrossMultiHeadAttention(nn.Module):
         self.register_buffer("sin", sin)
 
     def forward(self, x: torch.Tensor, encoder_output: torch.Tensor, kv_pad_mask: torch.Tensor = None) -> torch.Tensor:
-        """
-        Cross-attention: Q from decoder, K/V from encoder output.
-        
-        Args:
-            x: decoder hidden states (B, N_q, d_model)
-            encoder_output: encoder output (B, N_k, d_model)
-            kv_pad_mask: mask for encoder padding (B, 1, 1, N_k)
-        """
         B, N_q, D = x.shape
         N_k = encoder_output.size(1)
 
@@ -292,6 +286,35 @@ class Encoder(nn.Module):
             x = layer(x, pad_mask=pad_mask)
         return x
 
+class MixtureOfExperts(nn.Module):
+    def __init__(self, d_model: int, d_ff: int, num_experts: int, top_k: int, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.experts = nn.ModuleList([
+            FeedForward(d_model=d_model, d_hidden=d_ff, dropout=dropout)
+            for _ in range(num_experts)
+        ])
+        self.router = nn.Linear(in_features=d_model, out_features=num_experts)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, N, D = x.shape
+        router_logits = self.router(x)
+        top_k_logits, top_k_indices = torch.topk(router_logits, k=self.top_k, dim=-1)
+        top_k_probs = F.softmax(top_k_logits, dim=-1)
+        
+        output = torch.zeros_like(x)
+        for i in range(self.top_k):
+            expert_idx = top_k_indices[:, :, i]
+            weight = top_k_probs[:, :, i].unsqueeze(-1)
+            for e in range(self.num_experts):
+                mask = (expert_idx == e).unsqueeze(-1)
+                if mask.any():
+                    expert_out = self.experts[e](x)
+                    output = output + mask.float() * weight * expert_out
+        return output
+
 class DecoderLayer(nn.Module):
     def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float = 0.1) -> None:
         super().__init__()
@@ -301,8 +324,8 @@ class DecoderLayer(nn.Module):
         self.cmha = CrossMultiHeadAttention(d_model=d_model, num_heads=num_heads, dropout=dropout)
         self.dropout2 = nn.Dropout(p=dropout)
         self.norm2 = LayerNorm(d_model=d_model)
-        self.ff = FeedForward(d_model=d_model, d_hidden=d_ff, dropout=dropout)
         self.norm3 = LayerNorm(d_model=d_model)
+        self.moe = MixtureOfExperts(d_model=d_model, d_ff=d_ff, num_experts=NUM_EXPERTS, top_k=TOP_K, dropout=dropout)
 
     def forward(
             self,
@@ -315,8 +338,8 @@ class DecoderLayer(nn.Module):
         x = self.norm1(x + self.dropout1(x_mha))
         x_cmha = self.cmha.forward(x, encoder_output=encoder_output, kv_pad_mask=kv_pad_mask)
         x = self.norm2(x + self.dropout2(x_cmha))
-        x_ff = self.ff(x)
-        x = self.norm3(x + x_ff)
+        x_moe = self.moe(x)
+        x = self.norm3(x + x_moe)
         return x
 
 
