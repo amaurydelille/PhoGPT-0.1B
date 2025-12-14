@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import sentencepiece as spm
-from typing import List, Tuple, Optional
+from typing import List, Literal, Tuple, Optional
 import logging
 from pathlib import Path
 import time
@@ -27,26 +27,65 @@ NUM_LAYERS = 6
 NUM_HEADS = 8
 SRC_VOCAB_SIZE = 32000
 TGT_VOCAB_SIZE = 32000
+MAX_LEN = 128
 
 def get_sentences(file_path: str) -> List[str]:
     with open(file=file_path, mode='r', encoding='utf-8') as file:
         return file.readlines()
 
-class AttentionUtils:
-    @staticmethod
-    def make_kv_pad_mask(tokens: torch.Tensor, pad_id: Optional[int] = None) -> Optional[torch.Tensor]:
-        if not pad_id:
-            return None
+class Utils:
+    class RoPE:
+        @staticmethod
+        def build_rope_cache(max_seq_length: int, head_dim: int, device: Literal["cpu", "cuda", "mps"]) -> Tuple[torch.Tensor, torch.Tensor]:
+            assert head_dim % 2 == 0, "RoPE head dimension must be even"
 
-        keep = (tokens != pad_id)
-        return keep.unsqueeze(1).unsqueeze(2).to(dtype=torch.bool)
+            half_dim = head_dim // 2
 
-    @staticmethod
-    def make_q_pad_mask(tokens: torch.Tensor, pad_id: Optional[int]) -> Optional[torch.Tensor]:
-        if not pad_id:
-            return None
+            inv_freq = 1.0 / (
+                10000 ** (torch.arange(0, half_dim, device=device) / half_dim)
+            )
 
-        return (tokens != pad_id).unsqueeze(1).unsqueeze(3).to(dtype=torch.bool)
+            positions = torch.arange(max_seq_length, device=device)
+
+            angles = torch.einsum("i,j->ij", positions, inv_freq)
+
+            cos = torch.cos(angles)
+            sin = torch.sin(angles)
+
+            return cos, sin
+
+        @staticmethod
+        def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+            b, h, s, d = x.shape
+            assert d % 2 == 0, "RoPE dimension must be even"
+
+            x = x.view(b, h, s, d // 2, 2)
+            x1 = x[..., 0]
+            x2 = x[..., 1]
+
+            cos = cos[:s].unsqueeze(0).unsqueeze(0)
+            sin = sin[:s].unsqueeze(0).unsqueeze(0)
+
+            out1 = x1 * cos - x2 * sin
+            out2 = x1 * sin + x2 * cos
+
+            return torch.stack([out1, out2], dim=-1).reshape(b, h, s, d)
+
+    class Attention:
+        @staticmethod
+        def make_kv_pad_mask(tokens: torch.Tensor, pad_id: Optional[int] = None) -> Optional[torch.Tensor]:
+            if not pad_id:
+                return None
+
+            keep = (tokens != pad_id)
+            return keep.unsqueeze(1).unsqueeze(2).to(dtype=torch.bool)
+
+        @staticmethod
+        def make_q_pad_mask(tokens: torch.Tensor, pad_id: Optional[int]) -> Optional[torch.Tensor]:
+            if not pad_id:
+                return None
+
+            return (tokens != pad_id).unsqueeze(1).unsqueeze(3).to(dtype=torch.bool)
 
 class Tokenizer:
     def __init__(self, max_len: int, spm_model_path: str) -> None:
@@ -85,25 +124,8 @@ class Tokenizer:
         ids = [i for i in encoded.flatten().tolist() if i != self.pad_token and i not in (self.bos_token, self.eos_token)]
         return self.sp.decode(ids)
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, max_len: int = 5000) -> None:
-        super().__init__()
-
-        position = torch.arange(0, max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * -(torch.log(torch.tensor(10000.0)) / d_model))
-
-        pe = torch.zeros(max_len, d_model)
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-
-        self.register_buffer('pe', pe.unsqueeze(0))  # (1, max_len, d_model)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        seq_len = x.size(1)
-        return x + self.pe[:, :seq_len, :]
-
 class MultiHeadAttention(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, mask: bool = False) -> None:
+    def __init__(self, d_model: int, num_heads: int, mask: bool = False, device: Literal["cpu", "cuda", "mps"] = "cpu") -> None:
         assert d_model % num_heads == 0, "Wrong shapes buddy"
 
         super().__init__()
@@ -112,11 +134,20 @@ class MultiHeadAttention(nn.Module):
         self.num_heads = num_heads
         self.d_k = d_model // num_heads
 
-        self.q_proj = nn.Linear(in_features=self.d_model, out_features=self.d_model, bias=False)
-        self.k_proj = nn.Linear(in_features=self.d_model, out_features=self.d_model, bias=False)
-        self.v_proj = nn.Linear(in_features=self.d_model, out_features=self.d_model, bias=False)
+        self.q_proj = nn.Linear(in_features=self.d_model, out_features=self.d_model, bias=False).to(device)
+        self.k_proj = nn.Linear(in_features=self.d_model, out_features=self.d_model, bias=False).to(device)
+        self.v_proj = nn.Linear(in_features=self.d_model, out_features=self.d_model, bias=False).to(device)
 
-        self.out_proj = nn.Linear(in_features=self.d_k * num_heads, out_features=self.d_model, bias=False)
+        self.out_proj = nn.Linear(in_features=self.d_k * num_heads, out_features=self.d_model, bias=False).to(device)
+
+        cos, sin = Utils.RoPE.build_rope_cache(
+            max_seq_length=MAX_LEN,
+            head_dim=self.d_k,
+            device=device,
+        )
+
+        self.register_buffer("cos", cos)
+        self.register_buffer("sin", sin)
 
     def forward(self, x: torch.Tensor, attention_mask: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B, N, D = x.shape
@@ -124,6 +155,9 @@ class MultiHeadAttention(nn.Module):
         Q = self.q_proj(x).view(B, N, self.num_heads, self.d_k).transpose(1, 2)
         K = self.k_proj(x).view(B, N, self.num_heads, self.d_k).transpose(1, 2)
         V = self.v_proj(x).view(B, N, self.num_heads, self.d_k).transpose(1, 2) # B, n, N, d_k
+
+        Q = Utils.RoPE.apply_rope(Q, self.cos, self.sin)
+        K = Utils.RoPE.apply_rope(K, self.cos, self.sin)
 
         attention_scores = (Q @ K.transpose(-2, -1)) / (self.d_k ** 0.5) # B, d_k, N, N
 
@@ -143,7 +177,7 @@ class MultiHeadAttention(nn.Module):
         return self.out_proj(attention_values), K, V
 
 class CrossMultiHeadAttention(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, dropout: float = 0.1) -> None:
+    def __init__(self, d_model: int, num_heads: int, dropout: float = 0.1, device: Literal["cpu", "cuda", "mps"] = "cpu") -> None:
         assert d_model % num_heads == 0, "Wrong shapes buddy"
 
         super().__init__()
@@ -151,12 +185,21 @@ class CrossMultiHeadAttention(nn.Module):
         self.num_heads = num_heads
         self.d_k = d_model // num_heads
 
-        self.q_proj = nn.Linear(in_features=self.d_model, out_features=self.d_model, bias=False)
-        self.k_proj = nn.Linear(in_features=self.d_model, out_features=self.d_model, bias=False)
-        self.v_proj = nn.Linear(in_features=self.d_model, out_features=self.d_model, bias=False)
+        self.q_proj = nn.Linear(in_features=self.d_model, out_features=self.d_model, bias=False).to(device)
+        self.k_proj = nn.Linear(in_features=self.d_model, out_features=self.d_model, bias=False).to(device)
+        self.v_proj = nn.Linear(in_features=self.d_model, out_features=self.d_model, bias=False).to(device)
 
-        self.out_proj = nn.Linear(in_features=self.d_k * num_heads, out_features=self.d_model, bias=False)
+        self.out_proj = nn.Linear(in_features=self.d_k * num_heads, out_features=self.d_model, bias=False).to(device)
         self.dropout = nn.Dropout(p=dropout)
+
+        cos, sin = Utils.RoPE.build_rope_cache(
+            max_seq_length=MAX_LEN,
+            head_dim=self.d_k,
+            device=device,
+        )
+
+        self.register_buffer("cos", cos)
+        self.register_buffer("sin", sin)
 
     def forward(self, x: torch.Tensor, encoder_output: torch.Tensor, kv_pad_mask: torch.Tensor = None) -> torch.Tensor:
         """
@@ -173,6 +216,9 @@ class CrossMultiHeadAttention(nn.Module):
         Q = self.q_proj(x).view(B, N_q, self.num_heads, self.d_k).transpose(1, 2)
         K = self.k_proj(encoder_output).view(B, N_k, self.num_heads, self.d_k).transpose(1, 2)
         V = self.v_proj(encoder_output).view(B, N_k, self.num_heads, self.d_k).transpose(1, 2)
+
+        Q = Utils.RoPE.apply_rope(Q, self.cos, self.sin)
+        K = Utils.RoPE.apply_rope(K, self.cos, self.sin)
 
         attention_scores = (Q @ K.transpose(-2, -1)) / (self.d_k ** 0.5)  # (B, heads, N_q, N_k)
 
@@ -301,19 +347,17 @@ class Transformer(nn.Module):
         self.d_model = d_model
         self.src_embedding = nn.Embedding(src_vocab_size, d_model)
         self.tgt_embedding = nn.Embedding(tgt_vocab_size, d_model)
-        self.pe = PositionalEncoding(d_model=d_model)
         self.dropout = nn.Dropout(p=dropout)
         self.encoder = Encoder(d_model=d_model, num_heads=num_heads, num_layers=num_layers, d_ff=d_ff, dropout=dropout)
         self.decoder = Decoder(d_model=d_model, num_heads=num_heads, num_layers=num_layers, d_ff=d_ff, vocab_size=tgt_vocab_size, dropout=dropout)
 
     def forward(self, src: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
-        # Scale embeddings by sqrt(d_model) as per original paper
         scale = self.d_model ** 0.5
-        src_embedded = self.dropout(self.pe(self.src_embedding(src.long()) * scale))  # (B, seq_len, d_model)
-        tgt_embedded = self.dropout(self.pe(self.tgt_embedding(tgt.long()) * scale))  # (B, seq_len, d_model)
+        src_embedded = self.dropout(self.src_embedding(src.long()) * scale)
+        tgt_embedded = self.dropout(self.tgt_embedding(tgt.long()) * scale)
 
-        src_kv_mask = AttentionUtils.make_kv_pad_mask(tokens=src, pad_id=0)
-        tgt_q_mask = AttentionUtils.make_q_pad_mask(tokens=tgt, pad_id=0)
+        src_kv_mask = Utils.Attention.make_kv_pad_mask(tokens=src, pad_id=0)
+        tgt_q_mask = Utils.Attention.make_q_pad_mask(tokens=tgt, pad_id=0)
 
         encoder_output = self.encoder(src_embedded, pad_mask=src_kv_mask)
         return self.decoder(x=tgt_embedded, encoder_output=encoder_output, kv_pad_mask=src_kv_mask, q_pad_mask=tgt_q_mask)  # (B, seq_len, vocab_size)
@@ -329,11 +373,11 @@ class Trainer:
         self.batch_size = batch_size
         self.epochs = epochs
 
-        en_sents = project_root / "dataset" / "en_sents"
-        vi_sents = project_root / "dataset" / "vi_sents"
+        en_sents = project_root / "dataset" / "train.en"
+        vi_sents = project_root / "dataset" / "train.vi"
 
-        self.en_sents = get_sentences(str(en_sents))
-        self.vi_sents = get_sentences(str(vi_sents))
+        self.en_sents = get_sentences(str(en_sents))[:1]
+        self.vi_sents = get_sentences(str(vi_sents))[:1]
 
         self.en_tokenizer = Tokenizer(max_len=self.max_len, spm_model_path=str(project_root / "tokenizer" / "en_spm.model"))
         self.vi_tokenizer = Tokenizer(max_len=self.max_len, spm_model_path=str(project_root / "tokenizer" / "vi_spm.model"))
@@ -477,6 +521,7 @@ class Translator:
         )
         self.model.load_state_dict(ckpt["state_dict"])
         self.model.eval()
+        logger.info(f"Loaded model with {sum(p.numel() for p in self.model.parameters())} parameters")
 
         self.en_tokenizer = Tokenizer(max_len=ckpt.get("max_len", 128), spm_model_path=str(project_root / "tokenizer" / "en_spm.model"))
         self.vi_tokenizer = Tokenizer(max_len=ckpt.get("max_len", 128), spm_model_path=str(project_root / "tokenizer" / "vi_spm.model"))
@@ -550,7 +595,10 @@ class Translator:
             print()
 
 if __name__ == "__main__":
+    BATCH_SIZE = 128
+    EPOCHS = 1
+    trainer = Trainer(batch_size=BATCH_SIZE, epochs=EPOCHS, device="mps", verbose=False)
+    trainer.train()
 
-    translator = Translator(model_path=str(project_root / "checkpoints" / "transformer_epoch_1.pth"))
-    original = "How are you ?"
-    translator.run()
+    # translator = Translator(model_path=str(project_root / "checkpoints" / "transformer_epoch_2.pth"))
+    # translator.run()
