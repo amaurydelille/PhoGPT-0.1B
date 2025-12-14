@@ -89,6 +89,19 @@ class Utils:
 
             return (tokens != pad_id).unsqueeze(1).unsqueeze(3).to(dtype=torch.bool)
 
+    class MoE:
+        @staticmethod
+        def load_balance_loss(router_logits: torch.Tensor, top_k_indices: torch.Tensor, num_experts: int) -> torch.Tensor:
+            gate_probs = F.softmax(router_logits, dim=-1)
+            gate_probs_flat = gate_probs.view(-1, num_experts)
+            N = gate_probs_flat.size(0)
+            importance = gate_probs_flat.sum(dim=0) / N
+            indices_flat = top_k_indices.view(-1)
+            load = torch.bincount(indices_flat, minlength=num_experts).float()
+            load = load / indices_flat.numel()
+            return (importance * load).sum() * num_experts
+
+
 class Tokenizer:
     def __init__(self, max_len: int, spm_model_path: str) -> None:
         self.max_len = max_len
@@ -298,8 +311,7 @@ class MixtureOfExperts(nn.Module):
         ])
         self.router = nn.Linear(in_features=d_model, out_features=num_experts)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, N, D = x.shape
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         router_logits = self.router(x)
         top_k_logits, top_k_indices = torch.topk(router_logits, k=self.top_k, dim=-1)
         top_k_probs = F.softmax(top_k_logits, dim=-1)
@@ -313,7 +325,10 @@ class MixtureOfExperts(nn.Module):
                 if mask.any():
                     expert_out = self.experts[e](x)
                     output = output + mask.float() * weight * expert_out
-        return output
+
+        aux_loss = Utils.MoE.load_balance_loss(router_logits, top_k_indices, self.num_experts)
+
+        return output, aux_loss
 
 class DecoderLayer(nn.Module):
     def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float = 0.1) -> None:
@@ -333,14 +348,14 @@ class DecoderLayer(nn.Module):
             encoder_output: torch.Tensor,
             kv_pad_mask: Optional[torch.Tensor] = None,
             q_pad_mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         x_mha, _, _ = self.mha.forward(x=x, attention_mask=q_pad_mask)
         x = self.norm1(x + self.dropout1(x_mha))
         x_cmha = self.cmha.forward(x, encoder_output=encoder_output, kv_pad_mask=kv_pad_mask)
         x = self.norm2(x + self.dropout2(x_cmha))
-        x_moe = self.moe(x)
+        x_moe, aux_loss = self.moe(x)
         x = self.norm3(x + x_moe)
-        return x
+        return x, aux_loss
 
 
 class Decoder(nn.Module):
@@ -358,10 +373,13 @@ class Decoder(nn.Module):
             encoder_output: torch.Tensor,
             kv_pad_mask: Optional[torch.Tensor] = None,
             q_pad_mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        total_aux_loss = 0.0
         for layer in self.layers:
-            x = layer(x, encoder_output=encoder_output, kv_pad_mask=kv_pad_mask, q_pad_mask=q_pad_mask)
-        return self.linear(x)
+            x, aux_loss = layer(x, encoder_output=encoder_output, kv_pad_mask=kv_pad_mask, q_pad_mask=q_pad_mask)
+            total_aux_loss = total_aux_loss + aux_loss
+        logits = self.linear(x)
+        return logits, total_aux_loss
 
 class Transformer(nn.Module):
     def __init__(self, d_model: int, num_heads: int, num_layers: int, d_ff: int, 
@@ -449,7 +467,7 @@ class Trainer:
             tgt_in = torch.cat([bos, tgt_full[:, :-1]], dim=1)  # (B, L)
 
             self.optimizer.zero_grad()
-            logits = self.transformer(src, tgt_in)  # (B, L_logit, tgt_vocab)
+            logits, aux_loss = self.transformer(src, tgt_in)
 
             B, L_logit, V_tgt = logits.shape
             B2, L_tgt = tgt_full.shape
@@ -457,7 +475,8 @@ class Trainer:
             if L_logit != L_tgt:
                 tgt_full = tgt_full[:, :L_logit]
 
-            loss = self.criterion(logits.reshape(-1, V_tgt), tgt_full.reshape(-1).long())
+            ce_loss = self.criterion(logits.reshape(-1, V_tgt), tgt_full.reshape(-1).long())
+            loss = ce_loss + 0.01 * aux_loss
 
             with open(loss_metrics_file, 'a') as file:
                 writer = csv.writer(file)
@@ -562,7 +581,7 @@ class Translator:
         with torch.no_grad():
             for _ in range(max_len - 1):
                 tgt = torch.tensor(generated, dtype=torch.long, device=src.device).unsqueeze(0)
-                logits = self.model(src, tgt)
+                logits, _ = self.model(src, tgt)
                 next_id = logits[:, -1, :].argmax(dim=-1).item()
                 generated.append(next_id)
                 if next_id == eos_id:
@@ -589,7 +608,7 @@ class Translator:
         with torch.no_grad():
             for _ in range(max_len - 1):
                 tgt = torch.tensor(generated, dtype=torch.long, device=src.device).unsqueeze(0)
-                logits = self.model(src, tgt)
+                logits, _ = self.model(src, tgt)
                 next_id = logits[:, -1, :].argmax(dim=-1).item()
                 generated.append(next_id)
                 
@@ -604,7 +623,6 @@ class Translator:
                         new_text = current_text[len(previous_text):]
                         print(new_text, end="", flush=True)
                         previous_text = current_text
-                # time.sleep(0.1)
         
         print() 
 
@@ -619,7 +637,7 @@ class Translator:
 
 if __name__ == "__main__":
     BATCH_SIZE = 128
-    EPOCHS = 1
+    EPOCHS = 3
     trainer = Trainer(batch_size=BATCH_SIZE, epochs=EPOCHS, device="mps", verbose=False)
     trainer.train()
 

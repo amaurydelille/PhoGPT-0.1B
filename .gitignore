@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.DS_Store
+*.pth
+*.bin
+*.safetensors
+checkpoints/
+archives/
+dataset/train.en
+dataset/train.vi
+dataset/PhoMT/
+
